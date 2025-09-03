@@ -1,146 +1,130 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Complete Firewall Setup Script - Activities 4-1 & 4-2 Combined
-# Includes web server rules, OpenVPN rules, and performance optimizations
+# Elastic Defend lab tester (Linux)
+# Safe, reversible tests with a simple menu.
 
-echo "Setting up complete optimized iptables firewall rules..."
-echo "Includes: Web server forwarding, OpenVPN support, and performance optimizations"
+PURPLE="\033[35m"; GREEN="\033[32m"; YELLOW="\033[33m"; RED="\033[31m"; NC="\033[0m"
 
-# Variables
-WEB_SERVER_IP="192.168.1.80"
-OPENVPN_SERVER_IP="192.168.1.1"
-EXTERNAL_GATEWAY_PUBLIC_IP="172.16.10.100"
+log() { echo -e "${GREEN}[+]${NC} $*"; }
+warn() { echo -e "${YELLOW}[!]${NC} $*"; }
+err() { echo -e "${RED}[-]${NC} $*" >&2; }
 
-# Clear existing rules
-echo "Clearing existing rules..."
-sudo iptables -F
-sudo iptables -t nat -F
-sudo iptables -X
-sudo iptables -t nat -X
+need_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    return 1
+  fi
+}
 
-# Set default policies to DROP
-echo "Setting default policies to DROP..."
-sudo iptables --policy INPUT DROP
-sudo iptables --policy OUTPUT DROP
-sudo iptables --policy FORWARD DROP
+is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
 
-# Allow loopback traffic (essential for system operation)
-echo "Allowing loopback traffic..."
-sudo iptables -A INPUT -i lo -j ACCEPT
-sudo iptables -A OUTPUT -o lo -j ACCEPT
+kql_banner() {
+  echo -e "\n${PURPLE}KQL to verify in Kibana → Security → Explore → Events:${NC}"
+  echo -e "$1\n"
+}
 
-# PERFORMANCE OPTIMIZATION: Allow established and related connections FIRST
-echo "Setting up efficient connection tracking (PERFORMANCE OPTIMIZATION)..."
-sudo iptables -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-sudo iptables -A OUTPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-sudo iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+file_test() {
+  log "Running file create/delete test..."
+  local target
+  if is_root; then
+    target="/etc/cron.d/edr_test"
+    echo "# edr test $(date -u +%FT%TZ)" | tee "${target}" >/dev/null
+    sleep 2
+    rm -f "${target}"
+  else
+    warn "Not running as root; using user-writable fallback in /tmp."
+    target="/tmp/edr_test"
+    echo "# edr test $(date -u +%FT%TZ)" > "${target}"
+    sleep 2
+    rm -f "${target}"
+  fi
+  log "Created then removed: ${target}"
+  kql_banner "event.dataset : \"endpoint.events.file\" and file.path : \"${target}\""
+}
 
-# PERFORMANCE OPTIMIZATION: Allow ICMP (crucial for performance - path MTU discovery, ping, etc.)
-echo "Allowing ICMP traffic (PERFORMANCE OPTIMIZATION)..."
-sudo iptables -A INPUT -p icmp -j ACCEPT
-sudo iptables -A OUTPUT -p icmp -j ACCEPT
-sudo iptables -A FORWARD -p icmp -j ACCEPT
+netproc_test() {
+  log "Running process + network test with curl..."
+  if ! need_cmd curl; then
+    err "curl not found. Install it (e.g., sudo apt-get update && sudo apt-get install -y curl) and rerun."
+    return
+  fi
+  curl -I https://example.com >/dev/null 2>&1 || true
+  log "curl executed."
+  kql_banner $'Process events:\n  event.dataset : "endpoint.events.process" and process.name : "curl"\nNetwork events:\n  event.dataset : "endpoint.events.network" and process.name : "curl"'
+}
 
-# Set up masquerading for outgoing packets
-echo "Setting up masquerading..."
-sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+ssh_fail_test() {
+  log "Simulating repeated SSH login failures to localhost (6 attempts)..."
 
-# Allow External Gateway internet access
-echo "Allowing External Gateway internet access..."
-sudo iptables -A OUTPUT -o eth0 -j ACCEPT
-sudo iptables -A INPUT -i eth0 -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
+  # Check/offer to install requirements
+  local need_install=()
+  need_cmd ssh || need_install+=(openssh-client)
+  # We want an SSH server to accept and reject passwords
+  if ! systemctl list-unit-files | grep -q -E '^(ssh|sshd)\.service'; then
+    need_install+=(openssh-server)
+  fi
+  need_cmd sshpass || need_install+=(sshpass)
 
-# Allow DNS traffic (essential for performance)
-echo "Allowing DNS traffic..."
-sudo iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-sudo iptables -A INPUT -p udp --sport 53 -j ACCEPT
-sudo iptables -A INPUT -p tcp --sport 53 -j ACCEPT
-sudo iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+  if (( ${#need_install[@]} )); then
+    warn "Missing packages: ${need_install[*]}"
+    read -r -p "Install them now with apt-get? [y/N] " ans
+    if [[ "${ans,,}" == "y" ]]; then
+      sudo apt-get update -y
+      sudo apt-get install -y "${need_install[@]}"
+    else
+      err "Cannot proceed with SSH failure test without required packages."
+      return
+    fi
+  fi
 
-# FORWARD rules for DNS (internal network needs DNS)
-sudo iptables -A FORWARD -p udp --dport 53 -j ACCEPT
-sudo iptables -A FORWARD -p udp --sport 53 -j ACCEPT
-sudo iptables -A FORWARD -p tcp --dport 53 -j ACCEPT
-sudo iptables -A FORWARD -p tcp --sport 53 -j ACCEPT
+  # Ensure ssh service is running if present
+  if systemctl list-unit-files | grep -q '^ssh\.service'; then
+    sudo systemctl start ssh || true
+  elif systemctl list-unit-files | grep -q '^sshd\.service'; then
+    sudo systemctl start sshd || true
+  fi
 
-# Allow internal network to access internet (NEW connections)
-echo "Allowing internal to external traffic..."
-sudo iptables -A FORWARD -i eth1 -o eth0 -m conntrack --ctstate NEW -j ACCEPT
+  local user="${SUDO_USER:-$USER}"
+  warn "Using username '${user}' and a WRONG password to generate failures."
+  local WRONG="definitely-wrong-password"
 
-# ========================================
-# WEB SERVER RULES (Activity 4-1)
-# ========================================
-echo "Setting up web server port forwarding rules..."
+  for i in {1..6}; do
+    sshpass -p "${WRONG}" ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password \
+      -o PubkeyAuthentication=no -o ConnectTimeout=3 "${user}"@localhost true 2>/dev/null || true
+    sleep 1
+  done
 
-# DNAT rules for web server (HTTP and HTTPS)
-sudo iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 80 -j DNAT --to-destination $WEB_SERVER_IP
-sudo iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 443 -j DNAT --to-destination $WEB_SERVER_IP
+  log "Generated failed SSH logins."
+  echo -e "\n${PURPLE}If you enabled the System/Auth integration, check Discover with:${NC}"
+  echo -e '  data_stream.dataset: "system.auth" and message: "Failed password"\n'
+  echo -e "${PURPLE}If you enabled a brute-force rule, check Security → Alerts.${NC}\n"
+}
 
-# Allow incoming web traffic to web server
-sudo iptables -A FORWARD -i eth0 -o eth1 -p tcp --dport 80 -d $WEB_SERVER_IP -m conntrack --ctstate NEW -j ACCEPT
-sudo iptables -A FORWARD -i eth0 -o eth1 -p tcp --dport 443 -d $WEB_SERVER_IP -m conntrack --ctstate NEW -j ACCEPT
+run_all() {
+  file_test
+  netproc_test
+  ssh_fail_test
+}
 
-# SNAT for web server traffic
-sudo iptables -t nat -A POSTROUTING -o eth1 -p tcp --dport 80 -d $WEB_SERVER_IP -j SNAT --to-source $EXTERNAL_GATEWAY_PUBLIC_IP
-sudo iptables -t nat -A POSTROUTING -o eth1 -p tcp --dport 443 -d $WEB_SERVER_IP -j SNAT --to-source $EXTERNAL_GATEWAY_PUBLIC_IP
+menu() {
+  echo -e "${PURPLE}Elastic Defend — Safe Test Menu${NC}"
+  echo "1) File modification test (create/delete)"
+  echo "2) Process + network test (curl)"
+  echo "3) Repeated SSH login failures (needs System/Auth + ssh/sshpass)"
+  echo "4) Run ALL tests"
+  echo "5) Quit"
+  echo
+}
 
-# ========================================
-# OPENVPN RULES (Activity 4-2)
-# ========================================
-echo "Setting up OpenVPN firewall rules..."
-
-# TCP rules for OpenVPN (though OpenVPN typically uses UDP)
-sudo iptables -A FORWARD -i eth0 -o eth1 -p tcp --syn --dport 1194 -m conntrack --ctstate NEW -j ACCEPT
-sudo iptables -A FORWARD -i eth1 -o eth0 -p tcp --syn --sport 1194 -m conntrack --ctstate NEW -j ACCEPT
-
-# DNAT rule for OpenVPN UDP traffic (main OpenVPN traffic)
-sudo iptables -t nat -A PREROUTING -p udp --dport 1194 -j DNAT --to-destination $OPENVPN_SERVER_IP
-
-# SNAT rule for OpenVPN UDP traffic
-sudo iptables -t nat -A POSTROUTING -o eth1 -p udp --dport 1194 -d $OPENVPN_SERVER_IP -j SNAT --to-source $EXTERNAL_GATEWAY_PUBLIC_IP
-
-# FORWARD rules for OpenVPN UDP traffic
-sudo iptables -A FORWARD -p udp --dport 1194 -d $OPENVPN_SERVER_IP -j ACCEPT
-sudo iptables -A FORWARD -p udp --dport 1194 -j ACCEPT
-sudo iptables -A FORWARD -p udp --sport 1194 -j ACCEPT
-
-# Interface-specific FORWARD rules for OpenVPN UDP
-sudo iptables -A FORWARD -i eth0 -o eth1 -p udp --dport 1194 -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
-sudo iptables -A FORWARD -i eth1 -o eth0 -p udp --sport 1194 -m conntrack --ctstate ESTABLISHED -j ACCEPT
-
-# Save the rules
-echo "Saving iptables rules..."
-sudo netfilter-persistent save
-
-# Alternative save method if netfilter-persistent is not available
-sudo su -c 'iptables-save > /etc/iptables.rules'
-
-echo ""
-echo "================================================"
-echo "Complete firewall setup finished!"
-echo "================================================"
-echo ""
-echo "Configured services:"
-echo "✓ Web Server: HTTP/HTTPS forwarding to $WEB_SERVER_IP"
-echo "✓ OpenVPN: UDP/TCP port 1194 forwarding to $OPENVPN_SERVER_IP"
-echo "✓ Performance optimizations enabled"
-echo ""
-echo "Key optimizations applied:"
-echo "✓ ICMP traffic allowed (crucial for performance)"
-echo "✓ Efficient connection tracking (ESTABLISHED,RELATED first)"
-echo "✓ Optimized rule ordering"
-echo "✓ Proper DNS handling"
-echo ""
-echo "IP Addresses configured:"
-echo "- External Gateway Public IP: $EXTERNAL_GATEWAY_PUBLIC_IP"
-echo "- Web Server Internal IP: $WEB_SERVER_IP"
-echo "- OpenVPN Server Internal IP: $OPENVPN_SERVER_IP"
-echo ""
-echo "To verify the configuration:"
-echo "sudo iptables -L -v -n"
-echo "sudo iptables -t nat -L -v -n"
-echo ""
-echo "Test checklist:"
-echo "□ Web server accessible from external (port 80/443)"
-echo "□ Internal Ubuntu Desktop has fast internet access"
-echo "□ OpenVPN clients can connect (port 1194)"
+while true; do
+  menu
+  read -r -p "Choose an option [1-5]: " choice
+  case "${choice}" in
+    1) file_test ;;
+    2) netproc_test ;;
+    3) ssh_fail_test ;;
+    4) run_all ;;
+    5) log "Done. Capture your Kibana screenshots for the assignment."; exit 0 ;;
+    *) warn "Invalid choice."; ;;
+  esac
+done
